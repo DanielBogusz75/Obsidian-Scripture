@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-scripture",
+  "name": "Obsidian Scripture",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Bible reference lookup backed by local JW PUB files.",
+  "author": "Daniel Bogusz",
+  "isDesktopOnly": true
+}

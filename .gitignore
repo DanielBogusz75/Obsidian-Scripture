@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+node_modules/
+
+# User-provided JW PUB archives are copyrighted content and are not distributed
+*.jwpub
+
+# Virtual environments
+.venv
