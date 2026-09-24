@@ -1,14 +1,18 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+# Dependencies
 node_modules/
+
+# Local coding-agent tool state (not part of the project)
+.kilo/
+.kilocode/
+
+# OS / editor
+.DS_Store
+Thumbs.db
 
 # User-provided JW PUB archives are copyrighted content and are not distributed
 *.jwpub
 
-# Virtual environments
-.venv
+# Bible publications are copyrighted; download them yourself from jw.org
+bibles/
+
+# Note: release/ is intentionally tracked; do not ignore it here.
