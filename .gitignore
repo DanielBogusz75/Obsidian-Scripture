@@ -12,7 +12,10 @@ Thumbs.db
 # User-provided JW PUB archives are copyrighted content and are not distributed
 *.jwpub
 
-# Bible publications are copyrighted; download them yourself from jw.org
+# Bible publications (tekst en audio) are copyrighted; download them yourself from jw.org
 bibles/
+Bijbel/
+Biblia/
+Bible/
 
 # Note: release/ is intentionally tracked; do not ignore it here.

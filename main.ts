@@ -1,443 +1,512 @@
-import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile } from "obsidian";
-import { BibleLanguage } from "./src/bible/aliases";
-import { EpubReader, EpubResult } from "./src/bible/epubReader";
+import { App, Editor, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } from "obsidian";
+import { Passage, TAAL_INFO, TALEN, Taal, formatteerVerzen, parseerVerwijzing, parseerVerwijzingen } from "./src/bible/boeken";
+import { DaisyLezer, Fragment, Opslag, Vers, audioFragmenten, vindDaisyMappen, zoekVerzen } from "./src/bible/daisy";
 
-interface TranslationSetting { name: string; language: BibleLanguage; path: string; }
-interface ScripturePluginSettings { translations: [TranslationSetting, TranslationSetting, TranslationSetting]; notesFolder: string; }
-
-const LANGUAGE_LABELS: Record<BibleLanguage, string> = { en: "English", nl: "Dutch", pl: "Polish" };
-
-const DEFAULT_SETTINGS: ScripturePluginSettings = {
-	translations: [
-		{ name: "Dutch", language: "nl", path: "bibles/nwt_O.epub" },
-		{ name: "English", language: "en", path: "bibles/nwt_E.epub" },
-		{ name: "Polish", language: "pl", path: "" },
-	],
-	notesFolder: "Bible",
-};
-
-export default class ScripturePlugin extends Plugin {
-	settings!: ScripturePluginSettings;
-	private reader!: EpubReader;
-
-	async onload(): Promise<void> {
-		this.settings = mergeSettings(await this.loadData());
-		this.reader = new EpubReader(this.app);
-		this.addSettingTab(new ScriptureSettingTab(this.app, this));
-		this.addCommand({
-			id: "scripture-search",
-			name: "Scripture Search",
-			callback: () => new BibleLookupModal(this.app, this, this.app.workspace.activeEditor?.editor).open(),
-		});
-	}
-
-	/*
-	 * Bible references are intentionally command-only. Obsidian owns wiki-link
-	 * rendering, so automatic link interception is avoided here.
-	 */
-	private async decorateBibleLinks(element: HTMLElement, _context: any): Promise<void> {
-		this.repairBibleElements(element);
-		this.convertRawBibleText(element);
-		const textNodes: Text[] = [];
-		const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-		let node: Node | null;
-		while ((node = walker.nextNode())) {
-			if (!node.parentElement?.closest("a, .internal-embed")) textNodes.push(node as Text);
-		}
-		for (const textNode of textNodes) {
-			const pattern = /(!?)\[\[(bible\d*:[^\]|]+)(?:\|([^\]]+))?\]\]|(!?)\[([^\]]+)\]\((#?bible\d*:[^)]+)\)/gi;
-			if (!pattern.test(textNode.nodeValue ?? "")) continue;
-			pattern.lastIndex = 0;
-			const fragment = document.createDocumentFragment();
-			let lastIndex = 0;
-			for (const match of textNode.nodeValue!.matchAll(pattern)) {
-				fragment.append(textNode.nodeValue!.slice(lastIndex, match.index));
-				const isEmbed = Boolean(match[1] || match[4]);
-				const target = match[2] ?? match[6];
-				if (isEmbed) {
-					const inline = document.createElement("span");
-					inline.addClass("obsidian-scripture-inline");
-					inline.setText("Loading verse...");
-					fragment.append(inline);
-					void this.loadVerse(inline, target, true);
-				} else {
-					const link = document.createElement("a");
-					link.textContent = match[3] ?? match[5] ?? target.replace(/^#?bible\d*:/i, "");
-					link.setAttribute("href", "#");
-					link.setAttribute("data-bible-href", target);
-					fragment.append(link);
-				}
-				lastIndex = match.index! + match[0].length;
-			}
-			fragment.append(textNode.nodeValue!.slice(lastIndex));
-			textNode.replaceWith(fragment);
-		}
-
-		for (const link of Array.from(element.querySelectorAll<HTMLAnchorElement>('a[data-bible-href], a.internal-link, a[href^="bible"], a[href^="#bible"]'))) {
-			const bibleHref = link.dataset.bibleHref ?? link.getAttribute("data-href") ?? link.getAttribute("href")?.replace(/^#/, "") ?? "";
-			const parsed = parseBibleLink(bibleHref);
-			if (!parsed) continue;
-			const controlledLink = link.dataset.bibleControlled === "true" ? link : this.replaceBibleLink(link, bibleHref);
-			let popup: HTMLElement | undefined;
-			const show = async () => {
-				if (popup) return;
-				popup = document.createElement("div");
-				popup.addClass("obsidian-scripture-preview");
-				document.body.appendChild(popup);
-				const rect = controlledLink.getBoundingClientRect();
-				popup.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 420))}px`;
-				popup.style.top = `${rect.bottom + 6}px`;
-				await this.loadVerse(popup, bibleHref, false);
-			};
-			const hide = () => { popup?.remove(); popup = undefined; };
-			this.registerDomEvent(controlledLink, "mouseenter", () => void show());
-			this.registerDomEvent(controlledLink, "mouseleave", () => window.setTimeout(hide, 250));
-			this.registerDomEvent(controlledLink, "click", (event) => {
-				event.preventDefault();
-				void show();
-			});
-		}
-		for (const embed of Array.from(element.querySelectorAll<HTMLElement>(".internal-embed"))) {
-			const bibleHref = embed.dataset.bibleHref ?? embed.getAttribute("src") ?? embed.getAttribute("href") ?? embed.textContent ?? "";
-			if (!parseBibleLink(bibleHref)) continue;
-			const inline = document.createElement("span");
-			inline.addClass("obsidian-scripture-inline");
-			inline.setText("Loading verse...");
-			embed.replaceWith(inline);
-			void this.loadVerse(inline, bibleHref, true);
-		}
-	}
-
-	private convertRawBibleText(root: HTMLElement): void {
-		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-		const nodes: Text[] = [];
-		let node: Node | null;
-		while ((node = walker.nextNode())) {
-			if (node.parentElement?.closest("a, .internal-embed, .cm-editor")) continue;
-			if (/!?\[[^\]]+\]\((?:#?bible\d*):[^)]+\)/i.test(node.nodeValue ?? "") || /(?:^|\n)\s*(?:#?bible\d*):.+\s*$/im.test(node.nodeValue ?? "")) nodes.push(node as Text);
-		}
-		for (const textNode of nodes) {
-			const pattern = /(!?)\[([^\]]+)\]\(((?:#?bible\d*):[^)]+)\)|(^|\n)(\s*)((?:#?bible\d*):.+?)(?=\n|$)/gi;
-			const value = textNode.nodeValue ?? "";
-			const fragment = document.createDocumentFragment();
-			let lastIndex = 0;
-			for (const match of value.matchAll(pattern)) {
-				fragment.append(value.slice(lastIndex, match.index));
-				const target = match[3] ?? match[6];
-				const label = match[2] ?? target.replace(/^#?bible\d*:/i, "");
-				if (match[1] || match[4] !== undefined) {
-					const inline = document.createElement("span");
-					inline.addClass("obsidian-scripture-inline");
-					inline.setText("Loading verse...");
-					fragment.append(inline);
-					void this.loadVerse(inline, target, true);
-				} else {
-					const link = document.createElement("a");
-					link.textContent = label;
-					link.setAttribute("href", "#");
-					link.dataset.bibleHref = target;
-					fragment.append(link);
-				}
-				lastIndex = match.index! + match[0].length;
-			}
-			fragment.append(value.slice(lastIndex));
-			textNode.replaceWith(fragment);
-		}
-	}
-
-	private repairBibleElements(root: HTMLElement): void {
-		const candidates = [root, ...Array.from(root.querySelectorAll<HTMLElement>("a, .internal-link, .internal-embed"))];
-		for (const candidate of candidates) {
-			if (candidate.dataset.bibleRepaired === "true") continue;
-			const href = candidate.dataset.bibleHref ?? candidate.getAttribute("data-href") ?? candidate.getAttribute("href") ?? candidate.getAttribute("src") ?? "";
-			const text = candidate.textContent?.trim() ?? "";
-			const bibleHref = parseBibleLink(href) ? href : extractBibleTarget(text);
-			if (!bibleHref) continue;
-			candidate.dataset.bibleRepaired = "true";
-			if (candidate.matches(".internal-embed")) {
-				const inline = document.createElement("span");
-				inline.addClass("obsidian-scripture-inline");
-				inline.setText("Loading verse...");
-				candidate.replaceWith(inline);
-				void this.loadVerse(inline, bibleHref, true);
-			} else if (candidate instanceof HTMLAnchorElement) {
-				this.replaceBibleLink(candidate, bibleHref);
-			} else if (candidate.matches(".internal-link")) {
-				const link = document.createElement("a");
-				link.textContent = text.replace(/^.*?bible\d*:/i, "").replace(/".*$/, "").trim();
-				link.setAttribute("href", "#");
-				link.dataset.bibleHref = bibleHref;
-				link.dataset.bibleControlled = "true";
-				link.addClass("obsidian-scripture-link");
-				candidate.replaceWith(link);
-			}
-		}
-	}
-
-	private replaceBibleLink(link: HTMLAnchorElement, bibleHref: string): HTMLAnchorElement {
-		const replacement = document.createElement("a");
-		replacement.textContent = link.textContent || bibleHref.replace(/^bible\d*:/i, "");
-		replacement.setAttribute("href", "#");
-		replacement.setAttribute("data-bible-href", bibleHref);
-		replacement.dataset.bibleControlled = "true";
-		replacement.addClass("obsidian-scripture-link");
-		replacement.setAttr("title", "Hover or Alt-click to show the verse");
-		link.replaceWith(replacement);
-		return replacement;
-	}
-
-	async fetchBibleText(reference: string, language: BibleLanguage, biblePath: string): Promise<EpubResult> {
-		return this.reader.fetch(reference, language, biblePath);
-	}
-
-	private async loadVerse(container: HTMLElement, href: string, inline: boolean): Promise<void> {
-		const parsed = parseBibleLink(href);
-		if (!parsed) return;
-		try {
-			const translation = this.settings.translations[parsed.translation];
-			const biblePath = await this.findConfiguredBible(translation.path);
-			if (!biblePath) throw new Error(`No EPUB file found for ${translation.name}`);
-			const result = await this.fetchBibleText(parsed.reference, translation.language, biblePath);
-			container.setText(inline ? result.text : `${translation.name}: ${result.text}`);
-		} catch (error) {
-			container.setText(`Scripture lookup failed: ${String(error)}`);
-		}
-	}
-
-	async findConfiguredBible(configuredPath: string): Promise<string | undefined> {
-		const path = configuredPath.trim().replace(/^\/+/, "");
-		const file = this.app.vault.getAbstractFileByPath(path);
-		if (file instanceof TFile && file.extension.toLowerCase() === "epub") return file.path;
-		return this.app.vault.getFiles().find((candidate) => candidate.extension.toLowerCase() === "epub" && (!path || candidate.path.startsWith(`${path}/`)))?.path;
-	}
-
-	async saveSettings(): Promise<void> { await this.saveData(this.settings); }
+interface TaalInstellingen {
+	bijbelMap: string;
+	notitieMap: string;
 }
 
-class BibleLookupModal extends Modal {
-	private input!: HTMLTextAreaElement;
-	private translationSelect!: HTMLSelectElement;
-	private resultEl!: HTMLElement;
-	private results: Array<EpubResult & { reference: string; path: string; translation: string }> = [];
+interface ScriptuurInstellingen {
+	talen: Record<Taal, TaalInstellingen>;
+	// Extra map waarin automatisch naar DAISY-bestanden wordt gezocht.
+	zoekMap: string;
+	laatsteTaal: Taal;
+}
 
-	constructor(app: App, private readonly plugin: ScripturePlugin, private readonly editor: Editor | undefined) { super(app); }
+function standaardInstellingen(): ScriptuurInstellingen {
+	const talen = {} as Record<Taal, TaalInstellingen>;
+	for (const taal of TALEN) talen[taal] = { bijbelMap: TAAL_INFO[taal].bijbelMap, notitieMap: TAAL_INFO[taal].notitieMap };
+	return { talen, zoekMap: "", laatsteTaal: "nl" };
+}
+
+// Zet opgeslagen gegevens (ook uit versie 0.2 met één bijbelMap/notitieMap) om naar de huidige vorm.
+function laadInstellingen(data: any): ScriptuurInstellingen {
+	const instellingen = standaardInstellingen();
+	if (!data) return instellingen;
+	if (typeof data.bijbelMap === "string" && data.bijbelMap.trim()) instellingen.talen.nl.bijbelMap = data.bijbelMap.trim();
+	if (typeof data.notitieMap === "string" && data.notitieMap.trim()) instellingen.talen.nl.notitieMap = data.notitieMap.trim();
+	for (const taal of TALEN) {
+		const opgeslagen = data.talen?.[taal];
+		if (typeof opgeslagen?.bijbelMap === "string" && opgeslagen.bijbelMap.trim()) instellingen.talen[taal].bijbelMap = opgeslagen.bijbelMap.trim();
+		if (typeof opgeslagen?.notitieMap === "string" && opgeslagen.notitieMap.trim()) instellingen.talen[taal].notitieMap = opgeslagen.notitieMap.trim();
+	}
+	if (typeof data.zoekMap === "string") instellingen.zoekMap = data.zoekMap.trim();
+	if (TALEN.includes(data.laatsteTaal)) instellingen.laatsteTaal = data.laatsteTaal;
+	return instellingen;
+}
+
+interface Resultaat {
+	passage: Passage;
+	verzen: Vers[];
+	fragmenten: Fragment[];
+}
+
+export default class ScripturePlugin extends Plugin {
+	settings!: ScriptuurInstellingen;
+	private lezers = {} as Record<Taal, DaisyLezer>;
+	private opslag!: Opslag;
+	private extern!: (pad: string) => boolean;
+	private speler = new AudioSpeler(this);
+
+	async onload(): Promise<void> {
+		this.settings = laadInstellingen(await this.loadData());
+		const adapter = this.app.vault.adapter;
+		// Een absoluut pad (bijv. /home/naam/Bijbel of C:\\Bijbel) wordt rechtstreeks van schijf gelezen, ook buiten de kluis.
+		const fs = (window as any).require?.("fs/promises");
+		const extern = (pad: string) => Boolean(fs) && /^([a-zA-Z]:[\\/]|\/)/.test(pad);
+		this.extern = extern;
+		const opslag: Opslag = {
+			lijst: async (map) => {
+				if (extern(map)) {
+					const items = await fs.readdir(map, { withFileTypes: true });
+					return {
+						bestanden: items.filter((item: any) => item.isFile()).map((item: any) => `${map}/${item.name}`),
+						mappen: items.filter((item: any) => item.isDirectory()).map((item: any) => `${map}/${item.name}`),
+					};
+				}
+				const inhoud = await adapter.list(map);
+				return { bestanden: inhoud.files, mappen: inhoud.folders };
+			},
+			leesTekst: (pad) => (extern(pad) ? fs.readFile(pad, "utf8") : adapter.read(pad)),
+			leesBinair: async (pad) => new Uint8Array(extern(pad) ? await fs.readFile(pad) : await adapter.readBinary(pad)),
+		};
+		this.opslag = opslag;
+		for (const taal of TALEN) {
+			const bijbelMap = () => {
+				const map = this.settings.talen[taal].bijbelMap.trim() || TAAL_INFO[taal].bijbelMap;
+				return extern(map) ? map : normalizePath(map);
+			};
+			this.lezers[taal] = new DaisyLezer(opslag, bijbelMap, TAAL_INFO[taal].letter);
+		}
+		this.addSettingTab(new ScriptuurInstellingenTab(this.app, this));
+		this.addCommand({
+			id: "bijbeltekst",
+			name: "Bijbeltekst opzoeken",
+			callback: () => new BijbelModal(this.app, this, this.app.workspace.activeEditor?.editor).open(),
+		});
+		for (const taal of TALEN) this.registerMarkdownCodeBlockProcessor(TAAL_INFO[taal].audioBlok, (bron, element) => this.toonAudioKnoppen(bron, element, taal));
+	}
+
+	onunload(): void {
+		this.speler.stop();
+	}
+
+	async slaInstellingenOp(): Promise<void> {
+		await this.saveData(this.settings);
+		for (const taal of TALEN) this.lezers[taal].wis();
+	}
+
+	async zoek(passage: Passage): Promise<Resultaat> {
+		const hoofdstuk = await this.lezers[passage.taal].hoofdstuk(passage.boek.nummer, passage.hoofdstuk);
+		const verzen = zoekVerzen(hoofdstuk, passage.verzen);
+		return { passage: { ...passage, verzen: verzen.map((vers) => vers.nummer) }, verzen, fragmenten: audioFragmenten(hoofdstuk, verzen) };
+	}
+
+	async zoekAlles(invoer: string, taal: Taal): Promise<Resultaat[]> {
+		const passages = parseerVerwijzingen(invoer, taal);
+		if (!passages.length) throw new Error("Vul een verwijzing in, bijvoorbeeld Joh 3:16");
+		const resultaten: Resultaat[] = [];
+		for (const passage of passages) resultaten.push(await this.zoek(passage));
+		return resultaten;
+	}
+
+	laadAudio(taal: Taal, boek: number, bestand: string): Promise<Uint8Array> {
+		return this.lezers[taal].audio(boek, bestand);
+	}
+
+	// Zoekt in de kluis, de zoekmap en de mappen naast de ingestelde absolute paden naar DAISY-bestanden.
+	async herkenPaden(): Promise<Taal[]> {
+		const wortels = [""];
+		const voeg = (pad: string) => {
+			const schoon = pad.trim().replace(/\/+$/, "");
+			if (schoon && !wortels.includes(schoon)) wortels.push(schoon);
+		};
+		voeg(this.settings.zoekMap);
+		for (const taal of TALEN) {
+			const map = this.settings.talen[taal].bijbelMap.trim();
+			if (this.extern(map) && map.lastIndexOf("/") > 0) voeg(map.slice(0, map.lastIndexOf("/")));
+		}
+		const gevonden = await vindDaisyMappen(this.opslag, wortels);
+		const herkend: Taal[] = [];
+		for (const taal of TALEN) {
+			const map = gevonden.get(TAAL_INFO[taal].letter);
+			if (!map) continue;
+			this.settings.talen[taal].bijbelMap = map;
+			herkend.push(taal);
+		}
+		await this.slaInstellingenOp();
+		return herkend;
+	}
+
+	// Maakt per vers een notitie aan als die nog niet bestaat. Geeft het aantal nieuwe notities terug.
+	async maakNotities(resultaten: Resultaat[]): Promise<{ nieuw: number; bestaand: number }> {
+		let nieuw = 0;
+		let bestaand = 0;
+		for (const resultaat of resultaten) {
+			for (const vers of resultaat.verzen) {
+				const pad = this.notitiePad(resultaat.passage, vers.nummer);
+				if (this.app.vault.getAbstractFileByPath(pad) instanceof TFile) {
+					bestaand++;
+					continue;
+				}
+				await this.maakMap(pad.slice(0, pad.lastIndexOf("/")));
+				await this.app.vault.create(pad, notitieInhoud(resultaat.passage, vers));
+				nieuw++;
+			}
+		}
+		return { nieuw, bestaand };
+	}
+
+	notitieNaam(passage: Passage, vers: number): string {
+		return `${passage.boek.naam} ${passage.hoofdstuk}.${vers}`;
+	}
+
+	// Pad zonder .md; links gebruiken het hele pad omdat dezelfde boeknaam in meerdere talen voorkomt (bijv. Job).
+	notitieLinkDoel(passage: Passage, vers: number): string {
+		const map = this.settings.talen[passage.taal].notitieMap.trim() || TAAL_INFO[passage.taal].notitieMap;
+		return normalizePath(`${map}/${this.notitieNaam(passage, vers)}`);
+	}
+
+	private notitiePad(passage: Passage, vers: number): string {
+		return `${this.notitieLinkDoel(passage, vers)}.md`;
+	}
+
+	private async maakMap(map: string): Promise<void> {
+		let huidig = "";
+		for (const deel of map.split("/").filter(Boolean)) {
+			huidig = huidig ? `${huidig}/${deel}` : deel;
+			if (!this.app.vault.getAbstractFileByPath(huidig)) await this.app.vault.createFolder(huidig);
+		}
+	}
+
+	private toonAudioKnoppen(bron: string, element: HTMLElement, taal: Taal): void {
+		const container = element.createDiv("scriptuur-audio");
+		const regels = bron.split(/\r?\n/).map((regel) => regel.trim()).filter(Boolean);
+		for (const regel of regels) {
+			const knop = container.createEl("button", { cls: "scriptuur-audio-knop", text: `🔊 ${regel}` });
+			knop.addEventListener("click", async () => {
+				try {
+					await this.speler.speel(knop, taal, regel);
+				} catch (fout) {
+					new Notice(foutTekst(fout));
+				}
+			});
+		}
+	}
+}
+
+function foutTekst(fout: unknown): string {
+	return fout instanceof Error ? fout.message : String(fout);
+}
+
+function notitieInhoud(passage: Passage, vers: Vers): string {
+	const verwijzing = `${passage.boek.naam} ${passage.hoofdstuk}:${vers.nummer}`;
+	return `---\nType: Bijbel\nBijbelboek: ${passage.boek.naam}\nHoofdstuk: ${passage.hoofdstuk}\nVers: ${vers.nummer}\nAliases: ${verwijzing}\nTaal: ${TAAL_INFO[passage.taal].naam}\n---\n${vers.tekst}\n`;
+}
+
+// Eén blok per passage: kop met boek en hoofdstuk, gevolgd door "(vers) tekst"; "…" markeert overgeslagen verzen.
+function schrijfUit(resultaat: Resultaat, metKop: boolean): string {
+	const { passage, verzen } = resultaat;
+	const delen: string[] = [];
+	verzen.forEach((vers, index) => {
+		if (index > 0 && vers.nummer > verzen[index - 1].nummer + 1) delen.push("…");
+		delen.push(`(${vers.nummer}) ${vers.tekst}`);
+	});
+	const tekst = delen.join(" ");
+	return metKop ? `### ${passage.boek.naam} ${passage.hoofdstuk}\n${tekst}` : tekst;
+}
+
+function lopendeTekst(resultaat: Resultaat): string {
+	const { verzen } = resultaat;
+	if (verzen.length === 1) return verzen[0].tekst;
+	return schrijfUit(resultaat, false);
+}
+
+function verwijzingTekst(passage: Passage): string {
+	return `${passage.boek.naam} ${passage.hoofdstuk}:${formatteerVerzen(passage.verzen)}`;
+}
+
+function maakLinks(plugin: ScripturePlugin, resultaten: Resultaat[]): string {
+	let vorige: string | undefined;
+	const links: string[] = [];
+	for (const resultaat of resultaten) {
+		for (const vers of resultaat.verzen) {
+			const voorvoegsel = `${resultaat.passage.boek.naam} ${resultaat.passage.hoofdstuk}`;
+			const alias = voorvoegsel === vorige ? String(vers.nummer) : `${voorvoegsel}:${vers.nummer}`;
+			links.push(`[[${plugin.notitieLinkDoel(resultaat.passage, vers.nummer)}|${alias}]]`);
+			vorige = voorvoegsel;
+		}
+	}
+	return links.join(" ");
+}
+
+class BijbelModal extends Modal {
+	private invoer!: HTMLTextAreaElement;
+	private taalKeuze!: HTMLSelectElement;
+	private uitvoer!: HTMLElement;
+	private verwijzingMetTekst?: HTMLInputElement;
+	private audioMetTekst?: HTMLInputElement;
+
+	constructor(app: App, private readonly plugin: ScripturePlugin, private readonly editor: Editor | undefined) {
+		super(app);
+	}
 
 	onOpen(): void {
-		this.titleEl.setText("Scripture Search");
-		const controls = this.contentEl.createDiv("obsidian-scripture-lookup-controls");
-		this.input = controls.createEl("textarea", { placeholder: "Genesis 4:4,7,10" });
-		this.input.addClass("obsidian-scripture-reference-input");
-		this.translationSelect = controls.createEl("select");
-		this.plugin.settings.translations.forEach((translation, index) => this.translationSelect.add(new Option(translation.name, String(index))));
-		this.translationSelect.value = "0";
-		const lookupButton = controls.createEl("button", { text: "Look up" });
-		lookupButton.addEventListener("click", () => void this.lookup());
-		this.input.addEventListener("keydown", (event) => { if (event.key === "Enter") void this.lookup(); });
-		this.resultEl = this.contentEl.createEl("pre");
-		this.resultEl.addClass("obsidian-scripture-lookup-result");
-		this.input.focus();
+		this.titleEl.setText("Bijbeltekst");
+		const bediening = this.contentEl.createDiv("scriptuur-bediening");
+		this.taalKeuze = bediening.createEl("select", { cls: "dropdown" });
+		for (const taal of TALEN) this.taalKeuze.add(new Option(TAAL_INFO[taal].naam, taal));
+		this.taalKeuze.value = this.plugin.settings.laatsteTaal;
+		this.invoer = bediening.createEl("textarea", { cls: "scriptuur-invoer" });
+		const werkBij = () => this.invoer.setAttribute("placeholder", TAAL_INFO[this.taal()].voorbeeld);
+		this.taalKeuze.addEventListener("change", () => {
+			this.plugin.settings.laatsteTaal = this.taal();
+			void this.plugin.slaInstellingenOp();
+			werkBij();
+		});
+		werkBij();
+		this.invoer.addEventListener("keydown", (gebeurtenis) => {
+			if (gebeurtenis.key === "Enter" && (gebeurtenis.ctrlKey || gebeurtenis.metaKey)) void this.toonVoorbeeld();
+		});
+		bediening.createEl("small", { text: "Eén verwijzing per regel (of gescheiden door ;). Zonder vers wordt het hele hoofdstuk gebruikt." });
+		const voorbeeldKnop = bediening.createEl("button", { text: "Voorbeeld" });
+		voorbeeldKnop.addEventListener("click", () => void this.toonVoorbeeld());
+		this.uitvoer = this.contentEl.createEl("pre", { cls: "scriptuur-voorbeeld" });
+
+		const acties = this.contentEl.createDiv("scriptuur-acties");
+		const heeftEditor = Boolean(this.editor);
+		if (heeftEditor) {
+			this.actie(acties, "Invoegen", () => this.invoegen());
+			this.verwijzingMetTekst = this.actie(acties, "Verwijzen", () => this.verwijzen(), "Tekst uitschrijven");
+			this.audioMetTekst = this.actie(acties, "Audio invoer", () => this.audioInvoer(), "Tekst uitschrijven");
+		}
+		this.actie(acties, "Notitie", () => this.notitie());
+		this.invoer.focus();
 	}
 
-	private async lookup(): Promise<void> {
-		const references = this.input.value.split(/\r?\n|;/).map((value) => value.trim()).filter(Boolean);
-		if (!references.length) return;
-		this.resultEl.setText("Loading EPUB text...");
+	private taal(): Taal {
+		return this.taalKeuze.value as Taal;
+	}
+
+	private actie(houder: HTMLElement, titel: string, uitvoeren: () => Promise<void>, vinkje?: string): HTMLInputElement | undefined {
+		const rij = houder.createDiv("scriptuur-actie");
+		const knop = rij.createEl("button", { text: titel, cls: "mod-cta" });
+		knop.addEventListener("click", async () => {
+			try {
+				await uitvoeren();
+			} catch (fout) {
+				this.uitvoer.setText(foutTekst(fout));
+			}
+		});
+		if (!vinkje) return undefined;
+		const label = rij.createEl("label", { cls: "scriptuur-vinkje" });
+		const selectie = label.createEl("input", { type: "checkbox" });
+		label.createSpan({ text: vinkje });
+		return selectie;
+	}
+
+	private async toonVoorbeeld(): Promise<void> {
 		try {
-			const defaultTranslation = Number(this.translationSelect.value);
-			this.results = [];
-			for (const value of references) {
-				const parsed = parseBibleLink(`bible:${value}`);
-				const translationIndex = parsed?.translation === 0 && !/^(english|dutch|polish|en|nl|pl)\s+/i.test(value) ? defaultTranslation : parsed?.translation ?? defaultTranslation;
-				const reference = parsed?.reference ?? value;
-				const translation = this.plugin.settings.translations[translationIndex];
-				const path = await this.plugin.findConfiguredBible(translation.path);
-				if (!path) throw new Error(`No EPUB file found for ${translation.name}`);
-				const result = await this.plugin.fetchBibleText(reference, translation.language, path);
-				this.results.push({ reference: value, ...result, path, translation: translation.name });
-			}
-				this.resultEl.setText(this.results.map((result) => result.text).join("\n\n"));
-				this.contentEl.querySelectorAll(".obsidian-scripture-lookup-actions").forEach((actions) => actions.remove());
-			const actions = this.contentEl.createDiv("obsidian-scripture-lookup-actions");
-			if (this.editor) {
-				const insertButton = actions.createEl("button", { text: "Insert" });
-				insertButton.addClass("mod-cta");
-				insertButton.addEventListener("click", () => this.insertText());
-				const referenceButton = actions.createEl("button", { text: "Reference" });
-				referenceButton.addClass("mod-cta");
-				referenceButton.addEventListener("click", () => void this.insertReference());
-			}
-			const noteButton = actions.createEl("button", { text: "Note" });
-			noteButton.addClass("mod-cta");
-			noteButton.addEventListener("click", () => void this.createNote());
-		} catch (error) { this.results = []; this.resultEl.setText(`Scripture lookup failed: ${String(error)}`); }
+			this.uitvoer.setText("Laden...");
+			const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+			this.uitvoer.setText(resultaten.map((resultaat) => schrijfUit(resultaat, true)).join("\n\n"));
+		} catch (fout) {
+			this.uitvoer.setText(foutTekst(fout));
+		}
 	}
 
-	private insertText(): void {
-		if (!this.results.length || !this.editor) return;
-		this.editor.replaceSelection(this.results.map(formatInsertedResult).join("\n\n"));
+	private async verwerk(): Promise<Resultaat[]> {
+		const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+		const { nieuw } = await this.plugin.maakNotities(resultaten);
+		if (nieuw) new Notice(`${nieuw} ${nieuw === 1 ? "notitie" : "notities"} aangemaakt`);
+		return resultaten;
+	}
+
+	private plaats(tekst: string): void {
+		this.editor?.replaceSelection(tekst);
 		this.close();
 	}
 
-	private flattenNoteResults(): Array<EpubResult & { reference: string; path: string; translation: string }> {
-		return this.results.flatMap((result) => splitNoteResults(result));
+	private async invoegen(): Promise<void> {
+		const resultaten = await this.verwerk();
+		this.plaats(resultaten.map((resultaat) => schrijfUit(resultaat, true)).join("\n\n"));
 	}
 
-	private notePath(noteResult: EpubResult & { reference: string; path: string; translation: string }): string {
-		const folder = `${this.plugin.settings.notesFolder.trim().replace(/^\/+|\/+$/g, "")}/${noteResult.translation}`;
-		const safeReference = `${noteResult.book} ${noteResult.chapter}.${formatVerseFilename(noteResult.verses)}`;
-		return `${folder}/${safeReference}.md`;
+	private async verwijzen(): Promise<void> {
+		const resultaten = await this.verwerk();
+		if (!this.verwijzingMetTekst?.checked) return this.plaats(maakLinks(this.plugin, resultaten));
+		const blokken = resultaten.map((resultaat) => `${lopendeTekst(resultaat)} — ${maakLinks(this.plugin, [resultaat])}`);
+		this.plaats(blokken.join("\n\n"));
 	}
 
-	private noteContent(noteResult: EpubResult & { reference: string; path: string; translation: string }): string {
-		const reference = noteResult.reference.replace(/^(english|dutch|polish|en|nl|pl)\s+/i, "");
-		const firstVerse = noteResult.verses[0];
-		const lastVerse = noteResult.verses[noteResult.verses.length - 1];
-		const endVerse = noteResult.verses.length > 1 ? `Eindvers: ${lastVerse}\n` : "";
-		const noteText = noteResult.verses.map((verse, index) => `(${verse}) ${noteResult.verseTexts[index] ?? ""}`).join(" ");
-		return `---\nType: Bijbel\nBijbelboek: ${noteResult.book}\nHoofdstuk: ${noteResult.chapter}\nVers: ${firstVerse}\n${endVerse}Aliases: ${reference}\nTaal: ${noteResult.translation}\n---\n${noteText}${formatFootnotes(noteResult.footnotes)}\n`;
+	private async notitie(): Promise<void> {
+		const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+		const { nieuw, bestaand } = await this.plugin.maakNotities(resultaten);
+		if (!nieuw) new Notice(bestaand === 1 ? "De notitie bestaat al" : "De notities bestaan al");
+		else if (bestaand) new Notice(`${nieuw} aangemaakt; ${bestaand} bestonden al`);
+		else new Notice(`${nieuw} ${nieuw === 1 ? "notitie" : "notities"} aangemaakt`);
+		this.close();
 	}
 
-	private async ensureNote(noteResult: EpubResult & { reference: string; path: string; translation: string }): Promise<{ filePath: string; existed: boolean }> {
-		const filePath = this.notePath(noteResult);
-		await this.ensureFolder(filePath.slice(0, filePath.lastIndexOf("/")));
-		const existing = this.app.vault.getAbstractFileByPath(filePath);
-		const existed = existing instanceof TFile;
-		if (!existed) await this.app.vault.create(filePath, this.noteContent(noteResult));
-		return { filePath, existed };
+	private async audioInvoer(): Promise<void> {
+		const resultaten = await this.verwerk();
+		const metTekst = Boolean(this.audioMetTekst?.checked);
+		const blokken = resultaten.map((resultaat) => {
+			const knop = `\`\`\`${TAAL_INFO[resultaat.passage.taal].audioBlok}\n${verwijzingTekst(resultaat.passage)}\n\`\`\``;
+			return metTekst ? `${schrijfUit(resultaat, true)}\n\n${knop}` : knop;
+		});
+		this.plaats(blokken.join("\n\n"));
+	}
+}
+
+class AudioSpeler {
+	private audio?: HTMLAudioElement;
+	private knop?: HTMLButtonElement;
+	private bronUrls = new Map<string, string>();
+	private ronde = 0;
+	private beeindig?: () => void;
+
+	constructor(private readonly plugin: ScripturePlugin) {}
+
+	stop(): void {
+		this.ronde++;
+		this.beeindig?.();
+		this.beeindig = undefined;
+		if (this.audio) {
+			this.audio.pause();
+			this.audio.src = "";
+			this.audio = undefined;
+		}
+		if (this.knop) {
+			this.knop.removeClass("is-actief");
+			this.knop.setText(this.knop.dataset.label ?? this.knop.getText());
+			this.knop = undefined;
+		}
+		for (const url of this.bronUrls.values()) URL.revokeObjectURL(url);
+		this.bronUrls.clear();
 	}
 
-	private async createNote(): Promise<void> {
+	async speel(knop: HTMLButtonElement, taal: Taal, verwijzing: string): Promise<void> {
+		const wasActief = this.knop === knop;
+		this.stop();
+		if (wasActief) return;
+
+		const label = knop.getText();
+		knop.dataset.label = label;
+		this.knop = knop;
+		knop.addClass("is-actief");
+		knop.setText(`⏳ ${verwijzing}`);
+		const ronde = this.ronde;
 		try {
-			let created = 0;
-			let alreadyExisting = 0;
-			for (const noteResult of this.flattenNoteResults()) {
-				const { existed } = await this.ensureNote(noteResult);
-				if (existed) alreadyExisting++;
-				else created++;
+			const resultaat = await this.plugin.zoek(parseerVerwijzing(verwijzing, taal));
+			const boek = resultaat.passage.boek.nummer;
+			for (let i = 0; i < resultaat.fragmenten.length; i++) {
+				if (ronde !== this.ronde) return;
+				const fragment = resultaat.fragmenten[i];
+				const url = await this.url(taal, boek, fragment.bestand);
+				if (ronde !== this.ronde) return;
+				if (i === 0) knop.setText(`⏹ ${verwijzing}`);
+				await this.afspelen(url, fragment, ronde);
 			}
-			if (!created) new Notice("Note already exists");
-			else if (alreadyExisting) new Notice(`Created ${created} Bible note${created === 1 ? "" : "s"}; ${alreadyExisting} already exist${alreadyExisting === 1 ? "s" : ""}`);
-			else new Notice(`Created ${created} Bible note${created === 1 ? "" : "s"}`);
-			this.close();
-		} catch (error) { this.resultEl.setText(`Could not create note: ${String(error)}`); }
-	}
-
-	private async insertReference(): Promise<void> {
-		if (!this.editor) return;
-		try {
-			let previousBook: string | undefined;
-			const links: string[] = [];
-			for (const noteResult of this.flattenNoteResults()) {
-				await this.ensureNote(noteResult);
-				const verse = noteResult.verses[0];
-				const target = `${noteResult.book} ${noteResult.chapter}.${verse}`;
-				const isNewBook = noteResult.book !== previousBook;
-				const alias = isNewBook ? `${noteResult.book} ${noteResult.chapter}:${verse}` : String(verse);
-				links.push(`[[${target}|${alias}]]`);
-				previousBook = noteResult.book;
-			}
-			this.editor.replaceSelection(links.join(" "));
-			this.close();
-		} catch (error) { this.resultEl.setText(`Could not insert reference: ${String(error)}`); }
-	}
-
-	private async ensureFolder(folder: string): Promise<void> {
-		const parts = folder.split("/");
-		let current = "";
-		for (const part of parts) {
-			current = current ? `${current}/${part}` : part;
-			if (!this.app.vault.getAbstractFileByPath(current)) await this.app.vault.createFolder(current);
+		} finally {
+			if (ronde === this.ronde) this.stop();
 		}
 	}
-}
 
-function splitNoteResults(result: EpubResult & { reference: string; path: string; translation: string }): Array<EpubResult & { reference: string; path: string; translation: string }> {
-	// Rebuild the reference from the canonical book name rather than the raw (possibly abbreviated) search text.
-	return result.verses.map((verse, index) => ({ ...result, reference: `${result.book} ${result.chapter}:${verse}`, verses: [verse], verseTexts: [result.verseTexts[index] ?? ""], text: `${verse} ${result.verseTexts[index] ?? ""}` }));
-}
-
-function formatVerseFilename(verses: number[]): string {
-	if (verses.length > 1 && verses.every((verse, index) => verse === verses[0] + index)) return `${verses[0]}-${verses[verses.length - 1]}`;
-	return verses.join(",");
-}
-
-function formatInsertedResult(result: EpubResult & { reference: string; path: string; translation: string }): string {
-	const groups: string[][] = [];
-	let current: string[] = [];
-	let previousVerse: number | undefined;
-	for (const [index, verse] of result.verses.entries()) {
-		if (previousVerse !== undefined && verse < previousVerse) {
-			if (current.length) groups.push(current);
-			current = [];
-		}
-		if (previousVerse !== undefined && verse > previousVerse + 1) current.push("…");
-		const verseText = (result.verseTexts[index] ?? "").replace(/\[\^\d+\]/g, "").replace(/\s+/g, " ").trim();
-		current.push(`(${verse}) ${verseText}`);
-		previousVerse = verse;
+	private async url(taal: Taal, boek: number, bestand: string): Promise<string> {
+		const sleutel = `${taal}/${boek}/${bestand}`;
+		const bekend = this.bronUrls.get(sleutel);
+		if (bekend) return bekend;
+		const data = await this.plugin.laadAudio(taal, boek, bestand);
+		const url = URL.createObjectURL(new Blob([data as BlobPart], { type: "audio/mpeg" }));
+		this.bronUrls.set(sleutel, url);
+		return url;
 	}
-	if (current.length) groups.push(current);
-	return groups.map((group) => `### ${result.book} ${result.chapter}\n${group.join(" ")}`).join("\n\n");
-}
 
-function formatFootnotes(footnotes: string[]): string {
-	return footnotes.length ? `\n---\n${footnotes.map((footnote, index) => `[^${index + 1}]: ${footnote}`).join("\n")}` : "";
-}
-
-class ScriptureSettingTab extends PluginSettingTab {
-	constructor(app: App, private readonly plugin: ScripturePlugin) { super(app, plugin); }
-
-	display(): void {
-		this.containerEl.empty();
-		this.containerEl.createEl("p", { text: "Set a vault-relative EPUB file path or folder for each translation. A blank path searches the whole vault." });
-		new Setting(this.containerEl)
-			.setName("Bible notes folder")
-			.setDesc("Base folder; notes are created inside a language subfolder")
-			.addText((text) => text.setValue(this.plugin.settings.notesFolder).onChange(async (value) => { this.plugin.settings.notesFolder = value.trim() || "Bible"; await this.plugin.saveSettings(); }));
-		new Setting(this.containerEl)
-			.setName("Bible tools")
-			.setDesc("Search scripture to insert text or create a Bible verse note from the active EPUB")
-			.addButton((button) => button.setButtonText("Scripture Search").onClick(() => new BibleLookupModal(this.app, this.plugin, this.app.workspace.activeEditor?.editor).open()));
-		const bibleFiles = this.app.vault.getFiles().filter((file) => file.extension.toLowerCase() === "epub").sort((left, right) => left.path.localeCompare(right.path));
-		this.plugin.settings.translations.forEach((translation) => {
-			new Setting(this.containerEl).setName(translation.name).setDesc(`Language: ${LANGUAGE_LABELS[translation.language]}`).setHeading();
-			new Setting(this.containerEl).setName("Choose Bible file").addDropdown((dropdown) => {
-				dropdown.addOption("", "Search whole vault");
-				for (const file of bibleFiles) dropdown.addOption(file.path, file.path);
-				dropdown.setValue(translation.path);
-				dropdown.onChange(async (value) => { translation.path = value; await this.plugin.saveSettings(); });
+	private afspelen(url: string, fragment: Fragment, ronde: number): Promise<void> {
+		return new Promise((klaar, fout) => {
+			const audio = new Audio(url);
+			this.audio = audio;
+			const einde = () => {
+				this.beeindig = undefined;
+				audio.removeEventListener("timeupdate", controle);
+				audio.pause();
+				klaar();
+			};
+			this.beeindig = einde;
+			const controle = () => {
+				if (ronde !== this.ronde || audio.currentTime >= fragment.einde - 0.03) einde();
+			};
+			audio.addEventListener("timeupdate", controle);
+			audio.addEventListener("ended", einde);
+			audio.addEventListener("error", () => fout(new Error("De audio kan niet worden afgespeeld")));
+			audio.addEventListener("loadedmetadata", () => {
+				audio.currentTime = fragment.begin;
+				audio.play().catch(fout);
 			});
-			new Setting(this.containerEl).setName("Bible file or folder").setDesc("Vault-relative path").addText((text) => text.setValue(translation.path).onChange(async (value) => { translation.path = value; await this.plugin.saveSettings(); }));
 		});
 	}
 }
 
-function parseBibleLink(href: string): { reference: string; translation: number } | null {
-	try {
-		const prefix = /bible(\d*):(?:\/\/)?/i.exec(href.replace(/^#/, ""));
-		if (!prefix) return null;
-		const value = decodeURIComponent(href.slice((prefix.index ?? 0) + prefix[0].length).replace(/\+/g, " "));
-		const suffix = /(?:\?|\s+)translation=(\d+)\s*$/i.exec(value);
-		const referenceValue = (suffix ? value.slice(0, suffix.index) : value).trim();
-		const prefixTranslation = prefix[1] ? Number(prefix[1]) - 1 : 0;
-		const languagePrefix = /^(english|dutch|polish|en|nl|pl)\s+/i.exec(referenceValue);
-		const languageTranslation = languagePrefix ? { english: 0, en: 0, dutch: 1, nl: 1, polish: 2, pl: 2 }[languagePrefix[1].toLowerCase() as "english" | "en" | "dutch" | "nl" | "polish" | "pl"] : undefined;
-		const reference = (languagePrefix ? referenceValue.slice(languagePrefix[0].length) : referenceValue).trim();
-		const translation = suffix ? Number(suffix[1]) : languageTranslation ?? prefixTranslation;
-		return { reference, translation: Number.isInteger(translation) && translation >= 0 && translation < 3 ? translation : 0 };
-	} catch { return null; }
-}
+class ScriptuurInstellingenTab extends PluginSettingTab {
+	constructor(app: App, private readonly plugin: ScripturePlugin) {
+		super(app, plugin);
+	}
 
-function extractBibleTarget(value: string): string | null {
-	const match = /(?:#?bible\d*:[^)|\]]+)/i.exec(value);
-	return match?.[0]?.trim() ?? null;
-}
-
-function mergeSettings(data: Partial<ScripturePluginSettings> | null): ScripturePluginSettings {
-	// Name and language are fixed per translation slot; only the vault path is user-configurable.
-	const translations = Array.isArray(data?.translations) ? data.translations : [];
-	const saved = DEFAULT_SETTINGS.translations.map((defaultTranslation, index) => ({ ...defaultTranslation, path: translations[index]?.path ?? defaultTranslation.path }));
-	return { translations: saved.map((setting) => {
-		if (setting.path.toLowerCase().endsWith(".pdf")) setting.path = setting.path.replace(/\.pdf$/i, ".epub");
-		return setting;
-	}) as ScripturePluginSettings["translations"], notesFolder: data?.notesFolder?.trim() || "Bible" };
+	display(): void {
+		this.containerEl.empty();
+		new Setting(this.containerEl)
+			.setName("Paden automatisch herkennen")
+			.setDesc("Zoekt in de kluis (en in de zoekmap hieronder) naar DAISY-bestanden en stelt per taal de Bijbelmap in. Mappen naast een al ingesteld absoluut pad worden ook doorzocht.")
+			.addButton((knop) =>
+				knop.setButtonText("Herkennen").setCta().onClick(async () => {
+					knop.setDisabled(true);
+					try {
+						const herkend = await this.plugin.herkenPaden();
+						const gemist = TALEN.filter((taal) => !herkend.includes(taal)).map((taal) => TAAL_INFO[taal].naam);
+						new Notice(herkend.length ? `Herkend: ${herkend.map((taal) => TAAL_INFO[taal].naam).join(", ")}${gemist.length ? `. Niet gevonden: ${gemist.join(", ")}` : ""}` : "Geen DAISY-bestanden gevonden. Vul een zoekmap in en probeer opnieuw.");
+						this.display();
+					} catch (fout) {
+						new Notice(foutTekst(fout));
+					} finally {
+						knop.setDisabled(false);
+					}
+				}),
+			);
+		new Setting(this.containerEl)
+			.setName("Zoekmap (optioneel)")
+			.setDesc("Extra map om in te zoeken, relatief aan de kluis of een absoluut pad, bijvoorbeeld /home/daniel/Programming/Obsidian-Scripture.")
+			.addText((tekst) =>
+				tekst.setValue(this.plugin.settings.zoekMap).onChange(async (waarde) => {
+					this.plugin.settings.zoekMap = waarde.trim();
+					await this.plugin.slaInstellingenOp();
+				}),
+			);
+		for (const taal of TALEN) {
+			const info = TAAL_INFO[taal];
+			new Setting(this.containerEl).setName(info.naam).setHeading();
+			new Setting(this.containerEl)
+				.setName("Bijbelmap (DAISY)")
+				.setDesc(`Map met de ${info.naam.toLowerCase()}e DAISY-bestanden (nwt_01_Ge_${info.letter}.daisy.zip of een uitgepakte map). Relatief aan de kluis, of een absoluut pad.`)
+				.addText((tekst) =>
+					tekst.setValue(this.plugin.settings.talen[taal].bijbelMap).onChange(async (waarde) => {
+						this.plugin.settings.talen[taal].bijbelMap = waarde.trim() || info.bijbelMap;
+						await this.plugin.slaInstellingenOp();
+					}),
+				);
+			new Setting(this.containerEl)
+				.setName("Notitiemap")
+				.setDesc("Map waarin de Bijbelnotities (één per vers) worden aangemaakt.")
+				.addText((tekst) =>
+					tekst.setValue(this.plugin.settings.talen[taal].notitieMap).onChange(async (waarde) => {
+						this.plugin.settings.talen[taal].notitieMap = waarde.trim() || info.notitieMap;
+						await this.plugin.slaInstellingenOp();
+					}),
+				);
+		}
+		new Setting(this.containerEl)
+			.setName("Bijbeltekst opzoeken")
+			.addButton((knop) => knop.setButtonText("Openen").onClick(() => new BijbelModal(this.app, this.plugin, this.app.workspace.activeEditor?.editor).open()));
+	}
 }
