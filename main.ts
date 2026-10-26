@@ -12,12 +12,14 @@ interface ScriptuurInstellingen {
 	// Extra map waarin automatisch naar DAISY-bestanden wordt gezocht.
 	zoekMap: string;
 	laatsteTaal: Taal;
+	// Taal waarin de verwijzing wordt ingevoerd; leeg betekent dezelfde taal als de weergavetaal.
+	laatsteZoekTaal: Taal | "";
 }
 
 function standaardInstellingen(): ScriptuurInstellingen {
 	const talen = {} as Record<Taal, TaalInstellingen>;
 	for (const taal of TALEN) talen[taal] = { bijbelMap: TAAL_INFO[taal].bijbelMap, notitieMap: TAAL_INFO[taal].notitieMap };
-	return { talen, zoekMap: "", laatsteTaal: "nl" };
+	return { talen, zoekMap: "", laatsteTaal: "nl", laatsteZoekTaal: "" };
 }
 
 // Zet opgeslagen gegevens (ook uit versie 0.2 met één bijbelMap/notitieMap) om naar de huidige vorm.
@@ -33,6 +35,7 @@ function laadInstellingen(data: any): ScriptuurInstellingen {
 	}
 	if (typeof data.zoekMap === "string") instellingen.zoekMap = data.zoekMap.trim();
 	if (TALEN.includes(data.laatsteTaal)) instellingen.laatsteTaal = data.laatsteTaal;
+	if (TALEN.includes(data.laatsteZoekTaal)) instellingen.laatsteZoekTaal = data.laatsteZoekTaal;
 	return instellingen;
 }
 
@@ -103,8 +106,8 @@ export default class ScripturePlugin extends Plugin {
 		return { passage: { ...passage, verzen: verzen.map((vers) => vers.nummer) }, verzen, fragmenten: audioFragmenten(hoofdstuk, verzen) };
 	}
 
-	async zoekAlles(invoer: string, taal: Taal): Promise<Resultaat[]> {
-		const passages = parseerVerwijzingen(invoer, taal);
+	async zoekAlles(invoer: string, taal: Taal, zoekTaal: Taal = taal): Promise<Resultaat[]> {
+		const passages = parseerVerwijzingen(invoer, taal, zoekTaal);
 		if (!passages.length) throw new Error("Vul een verwijzing in, bijvoorbeeld Joh 3:16");
 		const resultaten: Resultaat[] = [];
 		for (const passage of passages) resultaten.push(await this.zoek(passage));
@@ -244,6 +247,7 @@ function maakLinks(plugin: ScripturePlugin, resultaten: Resultaat[]): string {
 class BijbelModal extends Modal {
 	private invoer!: HTMLTextAreaElement;
 	private taalKeuze!: HTMLSelectElement;
+	private zoekTaalKeuze!: HTMLSelectElement;
 	private uitvoer!: HTMLElement;
 	private verwijzingMetTekst?: HTMLInputElement;
 	private audioMetTekst?: HTMLInputElement;
@@ -255,13 +259,24 @@ class BijbelModal extends Modal {
 	onOpen(): void {
 		this.titleEl.setText("Bijbeltekst");
 		const bediening = this.contentEl.createDiv("scriptuur-bediening");
+		bediening.createEl("small", { text: "Weergavetaal (tekst en notities)" });
 		this.taalKeuze = bediening.createEl("select", { cls: "dropdown" });
 		for (const taal of TALEN) this.taalKeuze.add(new Option(TAAL_INFO[taal].naam, taal));
 		this.taalKeuze.value = this.plugin.settings.laatsteTaal;
+		bediening.createEl("small", { text: "Zoektaal (taal van de boeknaam in je invoer)" });
+		this.zoekTaalKeuze = bediening.createEl("select", { cls: "dropdown" });
+		this.zoekTaalKeuze.add(new Option("Zelfde als weergavetaal", ""));
+		for (const taal of TALEN) this.zoekTaalKeuze.add(new Option(TAAL_INFO[taal].naam, taal));
+		this.zoekTaalKeuze.value = this.plugin.settings.laatsteZoekTaal;
 		this.invoer = bediening.createEl("textarea", { cls: "scriptuur-invoer" });
-		const werkBij = () => this.invoer.setAttribute("placeholder", TAAL_INFO[this.taal()].voorbeeld);
+		const werkBij = () => this.invoer.setAttribute("placeholder", TAAL_INFO[this.zoekTaal()].voorbeeld);
 		this.taalKeuze.addEventListener("change", () => {
 			this.plugin.settings.laatsteTaal = this.taal();
+			void this.plugin.slaInstellingenOp();
+			werkBij();
+		});
+		this.zoekTaalKeuze.addEventListener("change", () => {
+			this.plugin.settings.laatsteZoekTaal = this.zoekTaalKeuze.value as Taal | "";
 			void this.plugin.slaInstellingenOp();
 			werkBij();
 		});
@@ -289,6 +304,10 @@ class BijbelModal extends Modal {
 		return this.taalKeuze.value as Taal;
 	}
 
+	private zoekTaal(): Taal {
+		return (this.zoekTaalKeuze.value || this.taalKeuze.value) as Taal;
+	}
+
 	private actie(houder: HTMLElement, titel: string, uitvoeren: () => Promise<void>, vinkje?: string): HTMLInputElement | undefined {
 		const rij = houder.createDiv("scriptuur-actie");
 		const knop = rij.createEl("button", { text: titel, cls: "mod-cta" });
@@ -309,7 +328,7 @@ class BijbelModal extends Modal {
 	private async toonVoorbeeld(): Promise<void> {
 		try {
 			this.uitvoer.setText("Laden...");
-			const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+			const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal(), this.zoekTaal());
 			this.uitvoer.setText(resultaten.map((resultaat) => schrijfUit(resultaat, true)).join("\n\n"));
 		} catch (fout) {
 			this.uitvoer.setText(foutTekst(fout));
@@ -317,7 +336,7 @@ class BijbelModal extends Modal {
 	}
 
 	private async verwerk(): Promise<Resultaat[]> {
-		const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+		const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal(), this.zoekTaal());
 		const { nieuw } = await this.plugin.maakNotities(resultaten);
 		if (nieuw) new Notice(`${nieuw} ${nieuw === 1 ? "notitie" : "notities"} aangemaakt`);
 		return resultaten;
@@ -341,7 +360,7 @@ class BijbelModal extends Modal {
 	}
 
 	private async notitie(): Promise<void> {
-		const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+		const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal(), this.zoekTaal());
 		const { nieuw, bestaand } = await this.plugin.maakNotities(resultaten);
 		if (!nieuw) new Notice(bestaand === 1 ? "De notitie bestaat al" : "De notities bestaan al");
 		else if (bestaand) new Notice(`${nieuw} aangemaakt; ${bestaand} bestonden al`);

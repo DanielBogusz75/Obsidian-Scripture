@@ -111,18 +111,20 @@ export function parseerVerzen(spec: string): number[] {
 }
 
 // Voorbeelden: "Joh 3:16", "1 Kor 13:1-8", "Gen 1:1-3,8", "Ps 23" (heel hoofdstuk).
-export function parseerVerwijzing(waarde: string, taal: Taal): Passage {
+// zoekTaal bepaalt hoe de boeknaam wordt herkend; taal bepaalt de boeknaam en tekst van het resultaat.
+export function parseerVerwijzing(waarde: string, taal: Taal, zoekTaal: Taal = taal): Passage {
 	const tekst = waarde.trim().replace(/\s+/g, " ");
 	const treffer = /^((?:[1-3]\s*)?[^\d:;,]+?)\.?\s*(\d+)(?:\s*:\s*(.+))?$/.exec(tekst);
 	if (!treffer) throw new Error(`Ongeldige verwijzing: "${waarde}"`);
-	const boek = zoekBoek(treffer[1].trim(), taal);
+	const gevonden = zoekBoek(treffer[1].trim(), zoekTaal);
+	const boek = BOEKEN[taal][gevonden.nummer - 1];
 	const hoofdstuk = Number(treffer[2]);
 	if (hoofdstuk < 1) throw new Error(`Ongeldig hoofdstuk: "${waarde}"`);
 	return { taal, boek, hoofdstuk, verzen: treffer[3] ? parseerVerzen(treffer[3]) : [] };
 }
 
-export function parseerVerwijzingen(waarde: string, taal: Taal): Passage[] {
-	return waarde.split(/\r?\n|;/).map((deel) => deel.trim()).filter(Boolean).map((deel) => parseerVerwijzing(deel, taal));
+export function parseerVerwijzingen(waarde: string, taal: Taal, zoekTaal: Taal = taal): Passage[] {
+	return waarde.split(/\r?\n|;/).map((deel) => deel.trim()).filter(Boolean).map((deel) => parseerVerwijzing(deel, taal, zoekTaal));
 }
 
 export function formatteerVerzen(verzen: number[]): string {

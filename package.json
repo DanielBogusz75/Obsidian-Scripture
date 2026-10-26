@@ -1,6 +1,6 @@
 {
   "name": "obsidian-scripture",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "build": "esbuild main.ts --bundle --external:obsidian --format=cjs --platform=browser --target=es2020 --outfile=main.js"

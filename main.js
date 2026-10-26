@@ -279,17 +279,18 @@ function parseerVerzen(spec) {
   }
   return verzen;
 }
-function parseerVerwijzing(waarde, taal) {
+function parseerVerwijzing(waarde, taal, zoekTaal = taal) {
   const tekst = waarde.trim().replace(/\s+/g, " ");
   const treffer = /^((?:[1-3]\s*)?[^\d:;,]+?)\.?\s*(\d+)(?:\s*:\s*(.+))?$/.exec(tekst);
   if (!treffer) throw new Error(`Ongeldige verwijzing: "${waarde}"`);
-  const boek = zoekBoek(treffer[1].trim(), taal);
+  const gevonden = zoekBoek(treffer[1].trim(), zoekTaal);
+  const boek = BOEKEN[taal][gevonden.nummer - 1];
   const hoofdstuk = Number(treffer[2]);
   if (hoofdstuk < 1) throw new Error(`Ongeldig hoofdstuk: "${waarde}"`);
   return { taal, boek, hoofdstuk, verzen: treffer[3] ? parseerVerzen(treffer[3]) : [] };
 }
-function parseerVerwijzingen(waarde, taal) {
-  return waarde.split(/\r?\n|;/).map((deel) => deel.trim()).filter(Boolean).map((deel) => parseerVerwijzing(deel, taal));
+function parseerVerwijzingen(waarde, taal, zoekTaal = taal) {
+  return waarde.split(/\r?\n|;/).map((deel) => deel.trim()).filter(Boolean).map((deel) => parseerVerwijzing(deel, taal, zoekTaal));
 }
 function formatteerVerzen(verzen) {
   const delen = [];
@@ -960,7 +961,7 @@ async function vindDaisyMappen(opslag, wortels, maxDiepte = 4) {
 function standaardInstellingen() {
   const talen = {};
   for (const taal of TALEN) talen[taal] = { bijbelMap: TAAL_INFO[taal].bijbelMap, notitieMap: TAAL_INFO[taal].notitieMap };
-  return { talen, zoekMap: "", laatsteTaal: "nl" };
+  return { talen, zoekMap: "", laatsteTaal: "nl", laatsteZoekTaal: "" };
 }
 function laadInstellingen(data) {
   const instellingen = standaardInstellingen();
@@ -974,6 +975,7 @@ function laadInstellingen(data) {
   }
   if (typeof data.zoekMap === "string") instellingen.zoekMap = data.zoekMap.trim();
   if (TALEN.includes(data.laatsteTaal)) instellingen.laatsteTaal = data.laatsteTaal;
+  if (TALEN.includes(data.laatsteZoekTaal)) instellingen.laatsteZoekTaal = data.laatsteZoekTaal;
   return instellingen;
 }
 var ScripturePlugin = class extends import_obsidian.Plugin {
@@ -1031,8 +1033,8 @@ var ScripturePlugin = class extends import_obsidian.Plugin {
     const verzen = zoekVerzen(hoofdstuk, passage.verzen);
     return { passage: { ...passage, verzen: verzen.map((vers) => vers.nummer) }, verzen, fragmenten: audioFragmenten(hoofdstuk, verzen) };
   }
-  async zoekAlles(invoer, taal) {
-    const passages = parseerVerwijzingen(invoer, taal);
+  async zoekAlles(invoer, taal, zoekTaal = taal) {
+    const passages = parseerVerwijzingen(invoer, taal, zoekTaal);
     if (!passages.length) throw new Error("Vul een verwijzing in, bijvoorbeeld Joh 3:16");
     const resultaten = [];
     for (const passage of passages) resultaten.push(await this.zoek(passage));
@@ -1172,13 +1174,24 @@ var BijbelModal = class extends import_obsidian.Modal {
   onOpen() {
     this.titleEl.setText("Bijbeltekst");
     const bediening = this.contentEl.createDiv("scriptuur-bediening");
+    bediening.createEl("small", { text: "Weergavetaal (tekst en notities)" });
     this.taalKeuze = bediening.createEl("select", { cls: "dropdown" });
     for (const taal of TALEN) this.taalKeuze.add(new Option(TAAL_INFO[taal].naam, taal));
     this.taalKeuze.value = this.plugin.settings.laatsteTaal;
+    bediening.createEl("small", { text: "Zoektaal (taal van de boeknaam in je invoer)" });
+    this.zoekTaalKeuze = bediening.createEl("select", { cls: "dropdown" });
+    this.zoekTaalKeuze.add(new Option("Zelfde als weergavetaal", ""));
+    for (const taal of TALEN) this.zoekTaalKeuze.add(new Option(TAAL_INFO[taal].naam, taal));
+    this.zoekTaalKeuze.value = this.plugin.settings.laatsteZoekTaal;
     this.invoer = bediening.createEl("textarea", { cls: "scriptuur-invoer" });
-    const werkBij = () => this.invoer.setAttribute("placeholder", TAAL_INFO[this.taal()].voorbeeld);
+    const werkBij = () => this.invoer.setAttribute("placeholder", TAAL_INFO[this.zoekTaal()].voorbeeld);
     this.taalKeuze.addEventListener("change", () => {
       this.plugin.settings.laatsteTaal = this.taal();
+      void this.plugin.slaInstellingenOp();
+      werkBij();
+    });
+    this.zoekTaalKeuze.addEventListener("change", () => {
+      this.plugin.settings.laatsteZoekTaal = this.zoekTaalKeuze.value;
       void this.plugin.slaInstellingenOp();
       werkBij();
     });
@@ -1203,6 +1216,9 @@ var BijbelModal = class extends import_obsidian.Modal {
   taal() {
     return this.taalKeuze.value;
   }
+  zoekTaal() {
+    return this.zoekTaalKeuze.value || this.taalKeuze.value;
+  }
   actie(houder, titel, uitvoeren, vinkje) {
     const rij = houder.createDiv("scriptuur-actie");
     const knop = rij.createEl("button", { text: titel, cls: "mod-cta" });
@@ -1222,14 +1238,14 @@ var BijbelModal = class extends import_obsidian.Modal {
   async toonVoorbeeld() {
     try {
       this.uitvoer.setText("Laden...");
-      const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+      const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal(), this.zoekTaal());
       this.uitvoer.setText(resultaten.map((resultaat) => schrijfUit(resultaat, true)).join("\n\n"));
     } catch (fout) {
       this.uitvoer.setText(foutTekst(fout));
     }
   }
   async verwerk() {
-    const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+    const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal(), this.zoekTaal());
     const { nieuw } = await this.plugin.maakNotities(resultaten);
     if (nieuw) new import_obsidian.Notice(`${nieuw} ${nieuw === 1 ? "notitie" : "notities"} aangemaakt`);
     return resultaten;
@@ -1249,7 +1265,7 @@ var BijbelModal = class extends import_obsidian.Modal {
     this.plaats(blokken.join("\n\n"));
   }
   async notitie() {
-    const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal());
+    const resultaten = await this.plugin.zoekAlles(this.invoer.value, this.taal(), this.zoekTaal());
     const { nieuw, bestaand } = await this.plugin.maakNotities(resultaten);
     if (!nieuw) new import_obsidian.Notice(bestaand === 1 ? "De notitie bestaat al" : "De notities bestaan al");
     else if (bestaand) new import_obsidian.Notice(`${nieuw} aangemaakt; ${bestaand} bestonden al`);

@@ -58,7 +58,7 @@ Onder **Instellingen > Obsidian Scripture**:
 
 ## Gebruik
 
-Voer het commando **Bijbeltekst opzoeken** uit (of gebruik de knop in de instellingen). Kies bovenin de **taal** (de keuze wordt onthouden) en typ een of meer verwijzingen, één per regel of gescheiden door `;`, met boeknamen en afkortingen in die taal:
+Voer het commando **Bijbeltekst opzoeken** uit (of gebruik de knop in de instellingen). Kies bovenin de **weergavetaal** (de taal van de tekst, boeknamen, notities, links en audio) en eventueel een aparte **zoektaal** (de taal van de boeknaam die je typt). Beide keuzes worden onthouden. Standaard staat de zoektaal op *Zelfde als weergavetaal*. Typ daarna een of meer verwijzingen, één per regel of gescheiden door `;`, met boeknamen en afkortingen in de zoektaal:
 
 ```text
 Joh 3:16          (Nederlands)
@@ -67,7 +67,7 @@ Rdz 1:1-3,8       (Pools; ook "J 3:16", "Pieśń nad Pieśniami 2:1")
 Ps 23
 ```
 
-Zonder vers wordt het hele hoofdstuk gebruikt. Met **Voorbeeld** (of Ctrl+Enter) zie je de tekst vooraf. Boeknamen mogen voluit of afgekort zijn; het unieke begin van een naam werkt ook, en bij meerdere mogelijkheden krijg je een melding.
+Met zoektaal *Engels* en weergavetaal *Nederlands* levert `John 3:16` bijvoorbeeld de Nederlandse tekst van Johannes 3:16 op, met `Johannes` in de kop, de notitie en de links. Zonder vers wordt het hele hoofdstuk gebruikt. Met **Voorbeeld** (of Ctrl+Enter) zie je de tekst vooraf. Boeknamen mogen voluit of afgekort zijn; het unieke begin van een naam werkt ook, en bij meerdere mogelijkheden krijg je een melding.
 
 | Knop | Resultaat |
 | --- | --- |

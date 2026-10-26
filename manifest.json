@@ -1,7 +1,7 @@
 {
   "id": "obsidian-scripture",
   "name": "Obsidian Scripture",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.5.0",
   "description": "Bijbelteksten invoegen, naar verwijzen en laten uitspreken met lokale DAISY-bestanden (tekst en audio) in het Nederlands, Engels en Pools.",
   "author": "Daniel Bogusz",
